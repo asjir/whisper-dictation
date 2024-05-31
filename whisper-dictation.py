@@ -4,28 +4,55 @@ import threading
 import pyaudio
 import numpy as np
 import rumps
+import itertools
 from pynput import keyboard
-from whisper import load_model
+from faster_whisper import WhisperModel
 import platform
 
 class SpeechTranscriber:
-    def __init__(self, model):
+    def __init__(self, model: WhisperModel):
         self.model = model
         self.pykeyboard = keyboard.Controller()
+        self.last: list[str] = []
+        self.prev_good = True #  Check that the last segment was verified. 
+        
 
     def transcribe(self, audio_data, language=None):
-        result = self.model.transcribe(audio_data, language=language)
+        result, _ = self.model.transcribe(audio_data, language=language)
+        result = list(map(lambda x: x.text, result))
+        if len(result) == 0: return
+        print(result)
+        # First check if I'm opening the new segment.
+        if len(result) > len(self.last):
+            to_write = result[-1]
+            self.prev_good = False
+        else:  # If still updating the last segment, then can calculate how much is matching and update.
+            new_text = result[-1]
+            matching = len(list(itertools.takewhile(lambda x: x[0]==x[1], zip(new_text, self.last[-1]))))
+            to_delete = len(self.last) - matching   
+            to_write = new_text[matching:]
+            self.pykeyboard.type("\b" * to_delete)
+            time.sleep(0.05)
+        self.last = result
+
+            # I'm still updating the last segment. 
+            # calculate the matching as it is now. Do the backspaces and writing the new text.
+            # then check if all the segments that are already written and completed are solid
+            
+
         is_first = True
-        for element in result["text"]:
-            if is_first and element == " ":
+        for element in to_write:
+            if is_first and element == " " and self.last == "":
                 is_first = False
                 continue
-
             try:
                 self.pykeyboard.type(element)
-                time.sleep(0.0025)
+                time.sleep(0.01)
             except:
                 pass
+
+    def clear(self): 
+        self.last = []
 
 class Recorder:
     def __init__(self, transcriber):
@@ -44,24 +71,32 @@ class Recorder:
         self.recording = True
         frames_per_buffer = 1024
         p = pyaudio.PyAudio()
+        frames = []
+        def callback(in_data: bytes | None, frame_count: int, time_info, flag):
+            frames.append(in_data)
+            return (in_data, pyaudio.paContinue)
+
         stream = p.open(format=pyaudio.paInt16,
                         channels=1,
                         rate=16000,
                         frames_per_buffer=frames_per_buffer,
-                        input=True)
-        frames = []
-
+                        input=True,
+                        stream_callback=callback)
+        
         while self.recording:
-            data = stream.read(frames_per_buffer)
-            frames.append(data)
+            # time.sleep(0.1)
+            now = time.time()
+            audio_data = np.frombuffer(b''.join(frames), dtype=np.int16)
+            audio_data_fp32 = audio_data.astype(np.float32) / 32768.0
+            self.transcriber.transcribe(audio_data_fp32, language)
+            elapsed = time.time() - now
+            if (elapsed < 0.5): time.sleep(0.5 - elapsed)
 
         stream.stop_stream()
         stream.close()
+        self.transcriber.clear()
         p.terminate()
 
-        audio_data = np.frombuffer(b''.join(frames), dtype=np.int16)
-        audio_data_fp32 = audio_data.astype(np.float32) / 32768.0
-        self.transcriber.transcribe(audio_data_fp32, language)
 
 
 class GlobalKeyListener:
@@ -94,9 +129,9 @@ class GlobalKeyListener:
 
 
 class StatusBarApp(rumps.App):
-    def __init__(self, recorder, languages=None, max_time=None):
+    def __init__(self, recorder, languages: None | list[str] =None, max_time=None):
         super().__init__("whisper", "⏯")
-        self.languages = languages
+        self.languages = languages or []
         self.current_language = languages[0] if languages is not None else None
 
         menu = [
@@ -111,7 +146,7 @@ class StatusBarApp(rumps.App):
                 menu.append(rumps.MenuItem(lang, callback=callback))
             menu.append(None)
             
-        self.menu = menu
+        self.menu: rumps.rumps.Menu = menu # type: ignore
         self.menu['Stop Recording'].set_callback(None)
 
         self.started = False
@@ -210,7 +245,8 @@ if __name__ == "__main__":
 
     print("Loading model...")
     model_name = args.model_name
-    model = load_model(model_name)
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+
     print(f"{model_name} model loaded")
     
     transcriber = SpeechTranscriber(model)

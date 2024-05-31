@@ -1,5 +1,4 @@
-openai
-openai-whisper
+faster-whisper
 pyaudio
 pynput
 keyboard
